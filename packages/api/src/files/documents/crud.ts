@@ -11,6 +11,17 @@ const DOCUMENT_PARSER_MAX_FILE_SIZE = 15 * megabyte;
 const ODT_MAX_DECOMPRESSED_SIZE = 50 * megabyte;
 
 /**
+ * Spreadsheets get a higher zip-safety cap than the generic office-document
+ * default (25MB/100MB). Operational spreadsheets commonly carry heavy
+ * per-cell formatting across a whole tab (conditional formatting, borders)
+ * with little real data, which inflates the decompressed XML far past 25MB
+ * without being a zip bomb — see USE-2655, a 3MB file with 35 data rows
+ * whose formatted tab decompressed to 79.7MB.
+ */
+const SPREADSHEET_MAX_ENTRY_BYTES = 200 * megabyte;
+const SPREADSHEET_MAX_TOTAL_BYTES = 250 * megabyte;
+
+/**
  * Parses an uploaded document and extracts its text content and metadata.
  * Handled types must stay in sync with `documentParserMimeTypes` from data-provider.
  *
@@ -115,18 +126,69 @@ async function excelSheetToText(file: Express.Multer.File): Promise<string> {
    * `.xls` (BIFF/CFB) is not a ZIP — magic-byte check skips the
    * validator for it (yauzl would reject it as malformed anyway). */
   if (data.length >= 4 && data[0] === 0x50 && data[1] === 0x4b) {
-    await assertSafeZipSize(data, { name: file.originalname ?? 'spreadsheet' });
+    await assertSafeZipSize(data, {
+      name: file.originalname ?? 'spreadsheet',
+      maxEntryBytes: SPREADSHEET_MAX_ENTRY_BYTES,
+      maxTotalBytes: SPREADSHEET_MAX_TOTAL_BYTES,
+    });
   }
   const workbook = read(data, { type: 'buffer' });
 
   let text = '';
   for (const sheetName of workbook.SheetNames) {
     const worksheet = workbook.Sheets[sheetName];
-    const worksheetAsCsvString = utils.sheet_to_csv(worksheet);
+    /* Shrink the declared range to the cells that actually carry a value or
+     * formula before converting. `sheet_to_csv`'s iteration bound comes from
+     * `!ref`, not from which rows have content — a tab formatted (but not
+     * filled) out to Excel's row limit declares a ~1M-row `!ref`, and
+     * `blankrows: false` alone still means iterating all of them. See
+     * USE-2655: this cut processing of the reproduction file from 27s/306MB
+     * to 0.5s/229MB on top of `blankrows: false`. */
+    trimSheetRangeToUsedCells(worksheet, utils);
+    const worksheetAsCsvString = utils.sheet_to_csv(worksheet, { blankrows: false });
     text += `${sheetName}:\n${worksheetAsCsvString}\n`;
   }
 
   return text;
+}
+
+/**
+ * Shrinks a worksheet's declared `!ref` range down to the bounding box of
+ * cells that actually carry a value or formula, keeping the original start
+ * cell and only shrinking the end. A no-op for sheets that already declare
+ * a tight range.
+ */
+function trimSheetRangeToUsedCells(
+  worksheet: import('xlsx').WorkSheet,
+  utils: typeof import('xlsx').utils,
+): void {
+  const ref = worksheet['!ref'];
+  if (!ref) {
+    return;
+  }
+  const declared = utils.decode_range(ref);
+  let maxRow = declared.s.r;
+  let maxCol = declared.s.c;
+  let hasValue = false;
+  for (const key of Object.keys(worksheet)) {
+    if (key.charCodeAt(0) === 33 /* '!' */) {
+      continue;
+    }
+    const cell = worksheet[key];
+    if (cell == null || (cell.v === undefined && cell.f === undefined)) {
+      continue;
+    }
+    const addr = utils.decode_cell(key);
+    if (addr.r > maxRow) {
+      maxRow = addr.r;
+    }
+    if (addr.c > maxCol) {
+      maxCol = addr.c;
+    }
+    hasValue = true;
+  }
+  const end = hasValue ? { r: maxRow, c: maxCol } : declared.s;
+  worksheet['!ref'] = utils.encode_range({ s: declared.s, e: end });
 }
 
 /**
