@@ -767,7 +767,17 @@ export async function excelSheetToHtml(buffer: Buffer): Promise<string> {
    * start with `PK\x03\x04`. Skipping the validator on a non-ZIP input
    * also avoids confusing yauzl errors leaking out as ZipBombError. */
   if (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b) {
-    await assertSafeZipSize(buffer, { name: 'spreadsheet' });
+    /* Spreadsheets get a higher cap than the generic office-document
+     * default (25MB/100MB) — see the matching override in
+     * documents/crud.ts (USE-2655) for why. The row cap below
+     * (`SPREADSHEET_MAX_ROWS_PER_SHEET`) already protects the preview
+     * from the resulting worksheet before `sheet_to_html` runs; only the
+     * zip-safety gate needs raising here. */
+    await assertSafeZipSize(buffer, {
+      name: 'spreadsheet',
+      maxEntryBytes: 200 * megabyte,
+      maxTotalBytes: 250 * megabyte,
+    });
   }
   const XLSX = await import('xlsx');
   const workbook = XLSX.read(buffer, { type: 'buffer' });
